@@ -1,0 +1,7 @@
+logs/
+dnn_feature/
+model/
+outputs/
+*.tar
+*.jpg
+*.png

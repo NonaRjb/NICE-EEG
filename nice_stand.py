@@ -12,6 +12,7 @@ import datetime
 import time
 import numpy as np
 import pandas as pd
+import pickle
 
 import torch
 import torch.nn as nn
@@ -23,13 +24,16 @@ from torch.autograd import Variable
 from einops.layers.torch import Rearrange
 
 
-gpus = [6]
-os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+gpus = [0]
+os.environ['CUDA_DEVICexiE_ORDER'] = 'PCI_BUS_ID'
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, gpus))
-result_path = '/home/NICE/results/' 
-model_idx = 'test0'
+# result_path = '/proj/rep-learning-robotics/users/x_nonra/NICE-EEG/outputs/' 
+# model_idx = 'test0'
  
 parser = argparse.ArgumentParser(description='Experiment Stimuli Recognition test with CLIP encoder')
+parser.add_argument('--result_path', default='/proj/rep-learning-robotics/users/x_nonra/NICE-EEG/outputs/', type=str)
+parser.add_argument('--data_path', default='/proj/rep-learning-robotics/users/x_nonra/eeg_asif_img/data/things_eeg_2/Preprocessed_data_250Hz/', type=str)
+parser.add_argument('--img_data_path', default='/proj/rep-learning-robotics/users/x_nonra/alignvis/data/things_eeg_img_embeddings', type=str)
 parser.add_argument('--dnn', default='clip', type=str)
 parser.add_argument('--epoch', default='200', type=int)
 parser.add_argument('--num_sub', default=10, type=int,
@@ -41,6 +45,16 @@ parser.add_argument('-batch_size', '--batch-size', default=1000, type=int,
                          'using Data Parallel or Distributed Data Parallel')
 parser.add_argument('--seed', default=2023, type=int,
                     help='seed for initializing training. ')
+
+
+img_embedding_dim = {
+    'dreamsim_clip_vitb32': 512,
+    'dreamsim_clip_vitb32_noalign': 512,
+    'gLocal_vit-l-14': 768,
+    'gLocal_vit-l-14_noalign': 768,
+    'harmonization_vitb16': 768,
+    'harmonization_vitb16_noalign': 768,
+}
 
 
 def weights_init_normal(m):
@@ -143,11 +157,17 @@ class IE():
     def __init__(self, args, nsub):
         super(IE, self).__init__()
         self.args = args
+
+        self.model_idx = self.args.dnn + '_' + str(nsub).zfill(2)
+        self.result_path = os.path.join(self.args.result_path, self.args.dnn, 'sub-' + format(nsub, '02'))
+        os.makedirs(self.result_path, exist_ok=True)
+        
         self.num_class = 200
         self.batch_size = args.batch_size
         self.batch_size_test = 400
         self.batch_size_img = 500 
         self.n_epochs = args.epoch
+        self.val_size = 0.2
 
         self.lambda_cen = 0.003
         self.alpha = 0.5
@@ -160,12 +180,12 @@ class IE():
         self.nSub = nsub
 
         self.start_epoch = 0
-        self.eeg_data_path = '/home/Data/Things-EEG2/Preprocessed_data_250Hz/'
-        self.img_data_path = './dnn_feature/'
+        self.eeg_data_path = self.args.data_path
+        self.img_data_path = self.args.img_data_path
         self.test_center_path = './dnn_feature/'
         self.pretrain = False
 
-        self.log_write = open(result_path + "log_subject%d.txt" % self.nSub, "w")
+        self.log_write = open(os.path.join(self.result_path, "log_subject%d.txt" % self.nSub), "w")
 
         self.Tensor = torch.cuda.FloatTensor
         self.LongTensor = torch.cuda.LongTensor
@@ -174,7 +194,7 @@ class IE():
         self.criterion_l2 = torch.nn.MSELoss().cuda()
         self.criterion_cls = torch.nn.CrossEntropyLoss().cuda()
         self.Enc_eeg = Enc_eeg().cuda()
-        self.Proj_eeg = Proj_eeg().cuda()
+        self.Proj_eeg = Proj_eeg(proj_dim=img_embedding_dim[self.args.dnn]).cuda()
         self.Proj_img = Proj_img().cuda()
         self.Enc_eeg = nn.DataParallel(self.Enc_eeg, device_ids=[i for i in range(len(gpus))])
         self.Proj_eeg = nn.DataParallel(self.Proj_eeg, device_ids=[i for i in range(len(gpus))])
@@ -204,8 +224,10 @@ class IE():
         return train_data, train_label, test_data, test_label
 
     def get_image_data(self):
-        train_img_feature = np.load(self.img_data_path + self.args.dnn + '_feature_maps_training.npy', allow_pickle=True)
-        test_img_feature = np.load(self.img_data_path + self.args.dnn + '_feature_maps_test.npy', allow_pickle=True)
+        # train_img_feature = np.load(self.img_data_path + self.args.dnn + '_feature_maps_training.npy', allow_pickle=True)
+        # test_img_feature = np.load(self.img_data_path + self.args.dnn + '_feature_maps_test.npy', allow_pickle=True)
+        train_img_feature = np.load(os.path.join(self.img_data_path, 'train_' + self.args.dnn + '.npy'))
+        test_img_feature = np.load(os.path.join(self.img_data_path, 'test_' + self.args.dnn + '.npy'))
 
         train_img_feature = np.squeeze(train_img_feature)
         test_img_feature = np.squeeze(test_img_feature)
@@ -224,19 +246,20 @@ class IE():
         self.Proj_img.apply(weights_init_normal)
 
         train_eeg, _, test_eeg, test_label = self.get_eeg_data()
-        train_img_feature, _ = self.get_image_data() 
-        test_center = np.load(self.test_center_path + 'center_' + self.args.dnn + '.npy', allow_pickle=True)
+        train_img_feature, test_img_feature = self.get_image_data() 
+        # test_center = np.load(self.test_center_path + 'center_' + self.args.dnn + '.npy', allow_pickle=True)
 
         # shuffle the training data
         train_shuffle = np.random.permutation(len(train_eeg))
         train_eeg = train_eeg[train_shuffle]
         train_img_feature = train_img_feature[train_shuffle]
 
-        val_eeg = torch.from_numpy(train_eeg[:740])
-        val_image = torch.from_numpy(train_img_feature[:740])
+        val_size = int(self.val_size * len(train_eeg))
+        val_eeg = torch.from_numpy(train_eeg[:val_size])
+        val_image = torch.from_numpy(train_img_feature[:val_size])
 
-        train_eeg = torch.from_numpy(train_eeg[740:])
-        train_image = torch.from_numpy(train_img_feature[740:])
+        train_eeg = torch.from_numpy(train_eeg[val_size:])
+        train_image = torch.from_numpy(train_img_feature[val_size:])
 
 
         dataset = torch.utils.data.TensorDataset(train_eeg, train_image)
@@ -245,8 +268,8 @@ class IE():
         self.val_dataloader = torch.utils.data.DataLoader(dataset=val_dataset, batch_size=self.batch_size, shuffle=False)
 
         test_eeg = torch.from_numpy(test_eeg)
-        # test_img_feature = torch.from_numpy(test_img_feature)
-        test_center = torch.from_numpy(test_center)
+        test_img_feature = torch.from_numpy(test_img_feature)
+        # test_center = torch.from_numpy(test_center)
         test_label = torch.from_numpy(test_label)
         test_dataset = torch.utils.data.TensorDataset(test_eeg, test_label)
         self.test_dataloader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=self.batch_size_test, shuffle=False)
@@ -337,9 +360,9 @@ class IE():
                         if vloss <= best_loss_val:
                             best_loss_val = vloss
                             best_epoch = e + 1
-                            torch.save(self.Enc_eeg.module.state_dict(), './model/' + model_idx + 'Enc_eeg_cls.pth')
-                            torch.save(self.Proj_eeg.module.state_dict(), './model/' + model_idx + 'Proj_eeg_cls.pth')
-                            torch.save(self.Proj_img.module.state_dict(), './model/' + model_idx + 'Proj_img_cls.pth')
+                            torch.save(self.Enc_eeg.module.state_dict(), './model/' + self.model_idx + 'Enc_eeg_cls.pth')
+                            torch.save(self.Proj_eeg.module.state_dict(), './model/' + self.model_idx + 'Proj_eeg_cls.pth')
+                            torch.save(self.Proj_img.module.state_dict(), './model/' + self.model_idx + 'Proj_img_cls.pth')
 
                 print('Epoch:', e,
                       '  Cos eeg: %.4f' % loss_eeg.detach().cpu().numpy(),
@@ -350,15 +373,16 @@ class IE():
 
 
         # * test part
-        all_center = test_center
+        # all_center = test_center
+        all_center = test_img_feature
         total = 0
         top1 = 0
         top3 = 0
         top5 = 0
 
-        self.Enc_eeg.load_state_dict(torch.load('./model/' + model_idx + 'Enc_eeg_cls.pth'), strict=False)
-        self.Proj_eeg.load_state_dict(torch.load('./model/' + model_idx + 'Proj_eeg_cls.pth'), strict=False)
-        self.Proj_img.load_state_dict(torch.load('./model/' + model_idx + 'Proj_img_cls.pth'), strict=False)
+        self.Enc_eeg.load_state_dict(torch.load('./model/' + self.model_idx + 'Enc_eeg_cls.pth'), strict=False)
+        self.Proj_eeg.load_state_dict(torch.load('./model/' + self.model_idx + 'Proj_eeg_cls.pth'), strict=False)
+        self.Proj_img.load_state_dict(torch.load('./model/' + self.model_idx + 'Proj_img_cls.pth'), strict=False)
 
         self.Enc_eeg.eval()
         self.Proj_eeg.eval()
@@ -390,13 +414,23 @@ class IE():
         self.log_write.write('The best epoch is: %d\n' % best_epoch)
         self.log_write.write('The test Top1-%.6f, Top3-%.6f, Top5-%.6f\n' % (top1_acc, top3_acc, top5_acc))
         
+        score_dict = {
+            'top1': top1_acc,
+            'top3': top3_acc,
+            'top5': top5_acc
+        }
+        with open(os.path.join(self.result_path, f'{self.args.dnn}_best_sub-{str(self.nSub).zfill(2)}.pkl'), 'wb') as f:
+            pickle.dump(score_dict, f)
         return top1_acc, top3_acc, top5_acc
         # writer.close()
 
 
 def main():
     args = parser.parse_args()
+    seed_everything(args.seed)
 
+    os.makedirs(args.result_path, exist_ok=True)
+    os.makedirs(os.path.join(args.result_path, args.dnn), exist_ok=True)
     num_sub = args.num_sub   
     cal_num = 0
     aver = []
@@ -407,14 +441,15 @@ def main():
 
         cal_num += 1
         starttime = datetime.datetime.now()
-        seed_n = np.random.randint(args.seed)
+        # seed_n = np.random.randint(args.seed)
+        seed_n = args.seed
 
         print('seed is ' + str(seed_n))
-        random.seed(seed_n)
-        np.random.seed(seed_n)
-        torch.manual_seed(seed_n)
-        torch.cuda.manual_seed(seed_n)
-        torch.cuda.manual_seed_all(seed_n)
+        # random.seed(seed_n)
+        # np.random.seed(seed_n)
+        # torch.manual_seed(seed_n)
+        # torch.cuda.manual_seed(seed_n)
+        # torch.cuda.manual_seed_all(seed_n)
 
         print('Subject %d' % (i+1))
         ie = IE(args, i + 1)
@@ -437,7 +472,19 @@ def main():
     column = np.arange(1, cal_num+1).tolist()
     column.append('ave')
     pd_all = pd.DataFrame(columns=column, data=[aver, aver3, aver5])
-    pd_all.to_csv(result_path + 'result.csv')
+    pd_all.to_csv(os.path.join(args.result_path, 'result.csv'))
+
+def seed_everything(seed_val):
+    np.random.seed(seed_val)
+    random.seed(seed_val)
+    torch.manual_seed(seed_val)
+    torch.cuda.manual_seed(seed_val)
+    torch.cuda.manual_seed_all(seed_val)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    return
 
 if __name__ == "__main__":
     print(time.asctime(time.localtime(time.time())))

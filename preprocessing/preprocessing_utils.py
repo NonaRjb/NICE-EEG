@@ -45,7 +45,7 @@ def epoching(args, data_part, seed):
 	for s in range(args.n_ses):
 
 		### Load the EEG data and convert it to MNE raw format ###
-		eeg_dir = os.path.join('Raw_data', 'sub-'+
+		eeg_dir = os.path.join('raw_eeg', 'sub-'+
 			format(args.sub,'02'), 'ses-'+format(s+1,'02'), 'raw_eeg_'+
 			data_part+'.npy')
 		eeg_data = np.load(os.path.join(args.project_dir, eeg_dir),
